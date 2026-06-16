@@ -1,0 +1,10 @@
+/downloads_absa
+.codex
+/verification_absa
+/verification_absa_store_test
+/verification_absa_test
+/.agents
+/cleaned
+/__pycache__
+/.venv
+.env
