@@ -7,12 +7,14 @@ import json
 import os
 import re
 import shutil
+import smtplib
 import socket
 import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from email.message import EmailMessage
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -45,6 +47,11 @@ COMMENTS_SLOT_FIELDS = [
     ("field14", "field15", "field16", "field17"),
     ("field18", "field19", "field20", "field21"),
     ("field22", "field23", "field24", "field25"),
+]
+
+COMPLETION_REPORT_TO = [
+    "helpdesk@iconis.co.za",
+    "dev@iconis.co.za",
 ]
 
 
@@ -1555,6 +1562,85 @@ def build_report_path(download_dir: str, date_str: str) -> str:
     return os.path.join(report_dir, f"absa_home_loan_extrascreen_update_{date_str}.json")
 
 
+def send_completion_report_email(
+    report_path: str,
+    report: dict[str, object],
+    report_lines: list[str],
+) -> bool:
+    smtp_host = os.getenv("MAIL_HOST", os.getenv("SMTP_HOST", "")).strip()
+    smtp_port = int(os.getenv("MAIL_PORT", os.getenv("SMTP_PORT", "587")).strip() or "587")
+    smtp_user = os.getenv("MAIL_USERNAME", os.getenv("SMTP_USER", "")).strip()
+    smtp_pass = os.getenv("MAIL_PASSWORD", os.getenv("SMTP_PASS", "")).strip()
+    smtp_from = os.getenv("MAIL_FROM_ADDRESS", os.getenv("SMTP_FROM", smtp_user)).strip()
+    auth_mode = os.getenv("MAIL_AUTH_MODE", os.getenv("SMTP_AUTH_MODE", "login")).strip().lower()
+    smtp_use_auth = auth_mode not in {"none", "noauth", "false", "0", "no"}
+    encryption = os.getenv("MAIL_ENCRYPTION", "").strip().lower()
+    smtp_use_tls = encryption not in {"", "null", "none", "false", "0", "no"} if "MAIL_ENCRYPTION" in os.environ else (
+        os.getenv("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+    )
+
+    missing = [name for name, value in (("SMTP_HOST", smtp_host), ("SMTP_FROM", smtp_from)) if not value]
+    if missing:
+        message = f"Completion report email skipped: missing SMTP settings: {', '.join(missing)}"
+        report_lines.append(message)
+        print(message)
+        return False
+
+    message = EmailMessage()
+    subject_timestamp = dt.datetime.now().strftime("%Y/%m/%d %-H:%M")
+    message["Subject"] = f"ABSA Home Loan Feedback Update Report -- {subject_timestamp}"
+    message["From"] = smtp_from
+    message["To"] = ", ".join(COMPLETION_REPORT_TO)
+    message.set_content(
+        "Good Day,\n\n"
+        "Please find attached the ABSA Home Loan feedback update report for the selected run.\n\n"
+        f"Date: {report.get('date', '')}\n"
+        f"Prepared updates: {report.get('prepared_updates', 0)}\n"
+        f"Success count: {report.get('success_count', 0)}\n"
+        f"Failure count: {report.get('failure_count', 0)}\n"
+        f"Verification workbooks: {len(report.get('verification_files', []))}\n\n"
+        "Kind Regards,\n"
+    )
+
+    with open(report_path, "rb") as handle:
+        message.add_attachment(
+            handle.read(),
+            maintype="application",
+            subtype="json",
+            filename=os.path.basename(report_path),
+        )
+
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            if attempt > 1:
+                print(f"Retrying completion report email (attempt {attempt}/3)...")
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+                if smtp_use_tls:
+                    server.starttls()
+                if smtp_use_auth and smtp_user:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(
+                    message,
+                    from_addr=smtp_from,
+                    to_addrs=COMPLETION_REPORT_TO,
+                )
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            report_lines.append(f"Completion report email attempt {attempt}/3 failed: {exc}")
+            print(f"Completion report email attempt {attempt}/3 failed: {exc}", file=sys.stderr)
+
+    if last_exc is not None:
+        report_lines.append(f"Completion report email failed: {last_exc}")
+        return False
+
+    report_lines.append("Completion report email sent: to=helpdesk@iconis.co.za, dev@iconis.co.za")
+    print("Completion report email sent: to=helpdesk@iconis.co.za, dev@iconis.co.za")
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     load_env_file(args.env_file)
@@ -1631,6 +1717,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         verification_paths = verification_recorder.finalize()
 
+    report_lines: list[str] = []
     report = {
         "date": date_str,
         "download_dir": os.path.abspath(args.download_dir),
@@ -1648,6 +1735,8 @@ def main(argv: list[str] | None = None) -> int:
     report_path = args.report_json or build_report_path(args.download_dir, date_str)
     with open(report_path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, default=str)
+
+    send_completion_report_email(report_path, report, report_lines)
 
     print(
         f"Completed with {update_summary['success_count']} success(es) and "
