@@ -48,6 +48,7 @@ COMMENTS_SLOT_FIELDS = [
     ("field18", "field19", "field20", "field21"),
     ("field22", "field23", "field24", "field25"),
 ]
+COMMENTS_MEMO_MAX_LENGTH = 254
 
 COMPLETION_REPORT_TO = [
     "helpdesk@iconis.co.za",
@@ -268,6 +269,12 @@ class HTTPStatusError(Exception):
         self.response = response
 
 
+class LegalSuiteResponseError(Exception):
+    def __init__(self, message: str, response: object | None = None) -> None:
+        super().__init__(message)
+        self.response = response
+
+
 def _post_form(url: str, headers: dict[str, str], data: object, timeout: int) -> HTTPResponseWrapper:
     encoded_data = urllib_parse.urlencode(data).encode("utf-8")
     request = urllib_request.Request(url, data=encoded_data, headers=headers, method="POST")
@@ -467,18 +474,24 @@ class LegalSuiteClient:
         response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         response.raise_for_status()
         try:
-            return response.json()
+            parsed = response.json()
         except ValueError:
             return response.text
+        if isinstance(parsed, dict) and parsed.get("errors"):
+            raise LegalSuiteResponseError(str(parsed.get("errors")), response=parsed)
+        return parsed
 
     def create_matter_extrascreen(self, payload: dict[str, object]) -> dict | str:
         url = f"{self._api_base}/matdocsc/store"
         response = post_with_retry(url, headers=self._headers(), data=payload, timeout=60)
         response.raise_for_status()
         try:
-            return response.json()
+            parsed = response.json()
         except ValueError:
             return response.text
+        if isinstance(parsed, dict) and parsed.get("errors"):
+            raise LegalSuiteResponseError(str(parsed.get("errors")), response=parsed)
+        return parsed
 
     def get_matter_extrascreen(self, matter_id: int | str, docscreenid: int | str) -> list[dict]:
         url = f"{self._api_base}/matdocsc/get"
@@ -574,6 +587,12 @@ def normalize_text(value: object) -> str | None:
     if text.startswith("'"):
         text = text[1:].strip()
     return text or None
+
+
+def truncate_text(value: str, max_length: int) -> str:
+    if max_length < 0:
+        return value
+    return value[:max_length]
 
 
 def normalize_number(value: object) -> int | float | str | None:
@@ -700,7 +719,7 @@ def build_comments_updates(path: str, screen_id: int, api_key_env: str, region: 
             memo_field, dialled_field, date_field, time_field = slot_fields
             if index < len(ordered_rows):
                 row = ordered_rows[index]
-                payload[memo_field] = row["comment"]
+                payload[memo_field] = truncate_text(row["comment"], COMMENTS_MEMO_MAX_LENGTH)
                 payload[dialled_field] = row["number_dialled"]
                 payload[date_field] = encode_legalsuite_date(row["date_value"])
                 payload[time_field] = format_legalsuite_time(row["date_value"])
@@ -1357,9 +1376,12 @@ def update_extrascreens(
                     verification_values,
                     worksheet_name=worksheet_name,
                 )
-        except HTTPStatusError as exc:
+        except (HTTPStatusError, LegalSuiteResponseError) as exc:
             failure_count += 1
-            error_text = exc.response.text if exc.response is not None else str(exc)
+            if isinstance(exc, HTTPStatusError):
+                error_text = exc.response.text if exc.response is not None else str(exc)
+            else:
+                error_text = str(exc)
             results.append(
                 {
                     "status": "failed",
