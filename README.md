@@ -9,10 +9,12 @@ Script: [absa_home_loan_extrascreen_update.py](/home/lordwiz/Documents/Peter's%2
 - Downloads the ABSA `Comments` and `PTP` workbooks for a given day from FTP.
 - Groups rows by `Account Number`.
 - Fetches the Legal Suite matter by `Matter.TheirRef`.
+- For DBN/JHB files, if the matter is not found with `LEGALSUITE_API_KEY`, the script retries the lookup with `LEGALSUITE_WC_API_KEY` before concluding the account is not found.
 - If multiple matters are found for the same account, only matters with `FileRef` starting with `A0038/` or `ABS697/` are eligible.
 - Updates the correct Legal Suite extra screen:
   - `553` for `Comments`
   - `552` for `PTP`
+- If a DBN/JHB lookup falls back to WC and matches there, the script updates the corresponding WC extra screen for that workbook type.
 - Writes a JSON run report under `downloads_absa/_reports/`.
 
 ## Credentials
@@ -23,6 +25,7 @@ The script reads these values from `.env` by default:
 - `FTP_USER`
 - `FTP_PASS`
 - `LEGALSUITE_API_KEY`
+- `LEGALSUITE_WC_API_KEY`
 
 ## Comments Mapping
 

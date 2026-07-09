@@ -39,6 +39,9 @@ TARGET_FILEREF_PREFIXES_BY_REGION = {
     DBN_JHB_REGION: ("A0038/", "ABS697/"),
     WC_REGION: ("ABS10/", "ABS34/"),
 }
+FALLBACK_REGION_BY_REGION = {
+    DBN_JHB_REGION: WC_REGION,
+}
 
 COMMENTS_SLOT_FIELDS = [
     ("field2", "field3", "field4", "field5"),
@@ -113,6 +116,10 @@ TARGET_FILES = [
         screen_id=376,
     ),
 ]
+TARGET_FILE_BY_KIND_AND_REGION = {
+    (target.kind, target.region): target
+    for target in TARGET_FILES
+}
 
 
 class VerificationWorkbookRecorder:
@@ -830,6 +837,46 @@ def build_updates_for_file(
     raise ValueError(f"Unsupported file kind: {kind}")
 
 
+def matter_lookup_candidates(item: dict[str, object]) -> list[dict[str, object]]:
+    kind = str(item.get("kind") or "")
+    primary_region = str(item.get("region") or "")
+    candidates = [
+        {
+            "region": primary_region,
+            "api_key_env": str(item.get("api_key_env") or ""),
+            "screen_id": int(item["screen_id"]),
+            "fallback": False,
+        }
+    ]
+    fallback_region = FALLBACK_REGION_BY_REGION.get(primary_region)
+    if not fallback_region or not kind:
+        return candidates
+
+    fallback_target = TARGET_FILE_BY_KIND_AND_REGION.get((kind, fallback_region))
+    if not fallback_target:
+        return candidates
+
+    candidates.append(
+        {
+            "region": fallback_target.region,
+            "api_key_env": fallback_target.api_key_env,
+            "screen_id": fallback_target.screen_id,
+            "fallback": True,
+        }
+    )
+    return candidates
+
+
+def required_api_envs_for_updates(updates: list[dict[str, object]]) -> list[str]:
+    api_envs: set[str] = set()
+    for item in updates:
+        for candidate in matter_lookup_candidates(item):
+            api_key_env = str(candidate.get("api_key_env") or "")
+            if api_key_env:
+                api_envs.add(api_key_env)
+    return sorted(api_envs)
+
+
 def download_targets(
     ftp_client: FTPClient,
     base_dir: str,
@@ -892,37 +939,68 @@ def update_extrascreens(
         worksheet_name = str(item.get("worksheet_name") or "")
         verification_row_number = int(item.get("verification_row_number") or 2)
         source_row_numbers = [int(row_number) for row_number in item.get("source_row_numbers", [])]
-        fileref_prefixes = TARGET_FILEREF_PREFIXES_BY_REGION.get(region, tuple())
-        client = clients_by_api_key_env.get(api_key_env)
-        if client is None:
-            failure_count += 1
-            results.append(
-                {
-                    "status": "failed",
-                    "reason": "missing_api_client",
-                    "account_number": account_number,
-                    "screen_id": screen_id,
-                    "api_key_env": api_key_env,
-                    "region": region,
-                    "source_file": source_file,
-                    "worksheet_name": worksheet_name,
-                    "source_row_numbers": source_row_numbers,
-                }
-            )
-            print(
-                f"Missing API client for TheirRef {account_number}: "
-                f"api_key_env={api_key_env or '<blank>'}"
-            )
-            continue
         source_rows_note = (
             f"Source rows used: {', '.join(str(row_number) for row_number in source_row_numbers)}"
             if source_row_numbers
             else ""
         )
 
-        try:
-            matter, matter_lookup_reason = client.get_matter_by_theirref(account_number, fileref_prefixes)
-        except Exception as exc:
+        lookup_attempts: list[dict[str, object]] = []
+        matter = None
+        matter_lookup_reason = "matter_not_found"
+        selected_lookup_candidate: dict[str, object] | None = None
+        lookup_error: Exception | None = None
+        for candidate in matter_lookup_candidates(item):
+            candidate_api_key_env = str(candidate["api_key_env"])
+            candidate_region = str(candidate["region"])
+            candidate_screen_id = int(candidate["screen_id"])
+            fileref_prefixes = TARGET_FILEREF_PREFIXES_BY_REGION.get(candidate_region, tuple())
+            client = clients_by_api_key_env.get(candidate_api_key_env)
+            if client is None:
+                lookup_attempts.append(
+                    {
+                        "api_key_env": candidate_api_key_env,
+                        "region": candidate_region,
+                        "screen_id": candidate_screen_id,
+                        "reason": "missing_api_client",
+                    }
+                )
+                continue
+
+            try:
+                matter, candidate_reason = client.get_matter_by_theirref(account_number, fileref_prefixes)
+            except Exception as exc:
+                lookup_error = exc
+                lookup_attempts.append(
+                    {
+                        "api_key_env": candidate_api_key_env,
+                        "region": candidate_region,
+                        "screen_id": candidate_screen_id,
+                        "reason": "matter_lookup_error",
+                        "error": str(exc),
+                    }
+                )
+                break
+
+            candidate_reason = candidate_reason or ""
+            lookup_attempts.append(
+                {
+                    "api_key_env": candidate_api_key_env,
+                    "region": candidate_region,
+                    "screen_id": candidate_screen_id,
+                    "reason": candidate_reason or "matched",
+                    "matched": bool(matter),
+                }
+            )
+            if matter:
+                selected_lookup_candidate = candidate
+                matter_lookup_reason = None
+                break
+            matter_lookup_reason = candidate_reason or "matter_not_found"
+            if candidate_reason != "matter_not_found":
+                break
+
+        if lookup_error is not None:
             failure_count += 1
             results.append(
                 {
@@ -932,19 +1010,20 @@ def update_extrascreens(
                     "screen_id": screen_id,
                     "api_key_env": api_key_env,
                     "region": region,
+                    "lookup_attempts": lookup_attempts,
                     "source_file": source_file,
                     "worksheet_name": worksheet_name,
                     "source_row_numbers": source_row_numbers,
-                    "error": str(exc),
+                    "error": str(lookup_error),
                 }
             )
-            print(f"Matter lookup failed for TheirRef {account_number}: {exc}")
+            print(f"Matter lookup failed for TheirRef {account_number}: {lookup_error}")
             if verification_recorder:
                 verification_recorder.record_row(
                     source_file,
                     verification_row_number,
                     "Failed",
-                    "; ".join(part for part in (f"matter_lookup_error: {exc}", source_rows_note) if part),
+                    "; ".join(part for part in (f"matter_lookup_error: {lookup_error}", source_rows_note) if part),
                     None,
                     {
                         "Verification Account Number": account_number,
@@ -963,6 +1042,7 @@ def update_extrascreens(
                     "screen_id": screen_id,
                     "api_key_env": api_key_env,
                     "region": region,
+                    "lookup_attempts": lookup_attempts,
                     "source_file": source_file,
                     "worksheet_name": worksheet_name,
                     "source_row_numbers": source_row_numbers,
@@ -984,6 +1064,46 @@ def update_extrascreens(
                     },
                     worksheet_name=worksheet_name,
                 )
+            continue
+
+        if selected_lookup_candidate is not None:
+            resolved_screen_id = int(selected_lookup_candidate["screen_id"])
+            resolved_api_key_env = str(selected_lookup_candidate["api_key_env"])
+            resolved_region = str(selected_lookup_candidate["region"])
+            if (
+                resolved_api_key_env != api_key_env
+                or resolved_region != region
+                or resolved_screen_id != screen_id
+            ):
+                print(
+                    f"Fallback lookup matched TheirRef {account_number} in region {resolved_region}; "
+                    f"switching api_key_env={resolved_api_key_env} screen_id={resolved_screen_id}."
+                )
+            screen_id = resolved_screen_id
+            api_key_env = resolved_api_key_env
+            region = resolved_region
+
+        client = clients_by_api_key_env.get(api_key_env)
+        if client is None:
+            failure_count += 1
+            results.append(
+                {
+                    "status": "failed",
+                    "reason": "missing_api_client",
+                    "account_number": account_number,
+                    "screen_id": screen_id,
+                    "api_key_env": api_key_env,
+                    "region": region,
+                    "lookup_attempts": lookup_attempts,
+                    "source_file": source_file,
+                    "worksheet_name": worksheet_name,
+                    "source_row_numbers": source_row_numbers,
+                }
+            )
+            print(
+                f"Missing API client for TheirRef {account_number}: "
+                f"api_key_env={api_key_env or '<blank>'}"
+            )
             continue
 
         matter_id = matter.get("recordid") or matter.get("matterid")
@@ -1710,13 +1830,15 @@ def main(argv: list[str] | None = None) -> int:
             api_key_env=api_key_env,
             region=region,
         )
+        for item in updates:
+            item["kind"] = kind
         all_updates.extend(updates)
         print(
             f"Prepared {len(updates)} {kind} update(s) from {os.path.basename(path)} "
             f"| region={region} | screen_id={screen_id}"
         )
 
-    api_envs_in_run = sorted({str(item.get("api_key_env") or "") for item in all_updates if item.get("api_key_env")})
+    api_envs_in_run = required_api_envs_for_updates(all_updates)
     missing_api_envs = [env_name for env_name in api_envs_in_run if not os.getenv(env_name, "").strip()]
     if missing_api_envs:
         raise SystemExit(f"Missing Legal Suite API key(s): {', '.join(missing_api_envs)}")
